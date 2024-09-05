@@ -138,7 +138,8 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
   }
 
   void containerCompleted(RMContainer rmContainer,
-      ContainerStatus containerStatus, RMContainerEventType event) {
+      ContainerStatus containerStatus, RMContainerEventType event,
+      String partition) {
     writeLock.lock();
     try {
       Container container = rmContainer.getContainer();
@@ -174,7 +175,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
       // Update usage metrics
       queue.getMetrics().releaseResources(
-          rmContainer.getNodeLabelExpression(),
+          partition,
           getUser(), 1, containerResource);
       this.attemptResourceUsage.decUsed(containerResource);
       getQueue().decUsedResource(containerResource);
@@ -453,9 +454,13 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
       }
 
       // Create RMContainer
+      String partition = null;
+      if (!getAppAttemptResourceUsage().getPending(node.getPartition()).equals(Resources.none())) {
+        partition = node.getPartition();
+      }
       rmContainer = new RMContainerImpl(container, schedulerKey,
           getApplicationAttemptId(), node.getNodeID(),
-          appSchedulingInfo.getUser(), rmContext);
+          appSchedulingInfo.getUser(), rmContext, partition);
       ((RMContainerImpl) rmContainer).setQueueName(this.getQueueName());
 
       // Add it to allContainers list.

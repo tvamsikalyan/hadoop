@@ -21,6 +21,7 @@ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.ha.HAServiceProtocol;
+import org.apache.hadoop.metrics2.MetricsSystem;
 import org.apache.hadoop.metrics2.impl.MetricsCollectorImpl;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.net.NetworkTopology;
@@ -35,6 +36,7 @@ import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
 import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.NodeId;
+import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
@@ -61,6 +63,8 @@ import org.apache.hadoop.yarn.server.resourcemanager.MockRMAppSubmitter;
 import org.apache.hadoop.yarn.server.resourcemanager.NodeManager;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.NullRMNodeLabelsManager;
+import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
 import org.apache.hadoop.yarn.server.resourcemanager.placement.ApplicationPlacementContext;
 import org.apache.hadoop.yarn.server.resourcemanager.placement.DefaultPlacementRule;
 import org.apache.hadoop.yarn.server.resourcemanager.placement.PlacementRule;
@@ -83,6 +87,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.TestPartitionQueueMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.TestSchedulerUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAddedSchedulerEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAttemptAddedSchedulerEvent;
@@ -140,11 +145,15 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableMap;
+import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableSet;
+
 @SuppressWarnings("unchecked")
 public class TestFairScheduler extends FairSchedulerTestBase {
   private final int GB = 1024;
   private final static String ALLOC_FILE =
       new File(TEST_DIR, "test-queues").getAbsolutePath();
+
 
   @Before
   public void setUp() throws IOException {
@@ -5668,6 +5677,93 @@ public class TestFairScheduler extends FairSchedulerTestBase {
         .getAppSchedulingInfo().getAllResourceRequests().isEmpty());
   }
 
+  @Test
+  public void testQueueMetricsWithNodeLabels() throws Exception {
+    RMNodeLabelsManager mgr;
+    mgr = new NullRMNodeLabelsManager();
+    mgr.init(conf);
+
+    // set node -> label
+    mgr.addToCluserNodeLabels(
+        ImmutableSet.of(NodeLabel.newInstance("x", false)));
+    mgr.addLabelsToNode(
+        ImmutableMap.of(NodeId.newInstance("h1", 0), toSet("x")));
+
+    // inject node label manager
+    MockRM rm1 = new MockRM(conf) {
+      @Override
+      public RMNodeLabelsManager createNodeLabelManager() {
+        return mgr;
+      }
+    };
+
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1 = rm1.registerNode("h1:1234", 10 * GB); // label = x
+    MockNM nm2 = rm1.registerNode("h2:1234", 10 * GB); // label = <no_label>
+    FairScheduler fs = (FairScheduler) rm1.getResourceScheduler();
+    RMNode rmNode1 = rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    SchedulerNode schedulerNode1 = fs.getSchedulerNode(nm1.getNodeId());
+    RMNode rmNode2 = rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+    SchedulerNode schedulerNode2 = fs.getSchedulerNode(nm2.getNodeId());
+    for (int i = 0; i < 50; i++) {
+      fs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+    for (int i = 0; i < 50; i++) {
+      fs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+    }
+    double delta = 0.0001;
+    FSQueue rootQueue = fs.getQueueManager().getRootQueue();
+    FSLeafQueue rootDefaultQueue =
+        new FSLeafQueue("root.default", fs, (FSParentQueue)rootQueue);
+    QueueMetrics rootDefaultQueueMetrics = rootDefaultQueue.getMetrics();
+    // app1 -> a
+    MockRMAppSubmissionData data =
+        MockRMAppSubmissionData.Builder.createWithMemory(1 * GB, rm1)
+            .withAppName("app")
+            .withUser("user")
+            .withAcls(null)
+            .withQueue("root.default")
+            .withUnmanagedAM(false)
+            .build();
+    RMApp app1 = MockRMAppSubmitter.submit(rm1, data);
+    MockAM am1 = MockRM.launchAndRegisterAM(app1, rm1, nm1);
+    MetricsSystem ms = rootDefaultQueue.getMetrics().getMetricsSystem();
+    QueueMetrics partXMetrics =
+        (QueueMetrics) TestPartitionQueueMetrics.queueSource(ms, "x", "root.default");
+    // app1 asks for 15 partition= containers
+    am1.allocate("*", 1 * GB, 15, new ArrayList<ContainerId>());
+
+    // all containers will be pending and only application master container is allocated
+    assertEquals(15 * GB, rootDefaultQueueMetrics.getPendingMB(), delta);
+    assertEquals(0 * GB, rootDefaultQueueMetrics.getAllocatedMB(), delta);
+    assertEquals(0 * GB, partXMetrics.getPendingMB(), delta);
+    assertEquals(1 * GB, partXMetrics.getAllocatedMB(), delta);
+
+    for (int i = 0; i < 50; i++) {
+      fs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+    for (int i = 0; i < 50; i++) {
+      fs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+    }
+   
+    // application master + 9 more containers go to rmNode1
+    // remaining 6 containers to go trmNode2 
+    assertEquals(0 * GB, rootDefaultQueueMetrics.getPendingMB(), delta);
+    assertEquals(6 * GB, rootDefaultQueueMetrics.getAllocatedMB(), delta);
+    assertEquals(0 * GB, partXMetrics.getPendingMB(), delta);
+    assertEquals(10 * GB, partXMetrics.getAllocatedMB(), delta);
+
+    rm1.killApp(app1.getApplicationId());
+    rm1.waitForState(app1.getApplicationId(), RMAppState.KILLED);
+    rm1.close();
+
+    assertEquals(0 * GB, rootDefaultQueueMetrics.getPendingMB(), delta);
+    assertEquals(0 * GB, rootDefaultQueueMetrics.getAllocatedMB(), delta);
+    assertEquals(0 * GB, partXMetrics.getPendingMB(), delta);
+    assertEquals(0 * GB, partXMetrics.getAllocatedMB(), delta);
+  }
+
   private void generateAllocationFilePercentageResource() {
     AllocationFileWriter.create()
       .addQueue(new AllocationFileQueue.Builder("root")
@@ -5683,5 +5779,11 @@ public class TestFairScheduler extends FairSchedulerTestBase {
               .build())
           .build())
       .writeToFile(ALLOC_FILE);
+  }
+
+  @SuppressWarnings("unchecked")
+  private <E> Set<E> toSet(E... elements) {
+    Set<E> set = Sets.newHashSet(elements);
+    return set;
   }
 }

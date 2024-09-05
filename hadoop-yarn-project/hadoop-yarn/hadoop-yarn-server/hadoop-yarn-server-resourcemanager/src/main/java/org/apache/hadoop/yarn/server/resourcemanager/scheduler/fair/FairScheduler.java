@@ -752,7 +752,11 @@ public class FairScheduler extends
           LOG.debug("Skipping unreserve on removed node: {}", nodeID);
         }
       } else {
-        application.containerCompleted(rmContainer, containerStatus, event);
+        String partition = null;
+        if (node != null) {
+          partition = node.getPartition();
+        }
+        application.containerCompleted(rmContainer, containerStatus, event, partition);
         if (node != null) {
           node.releaseContainer(rmContainer.getContainerId(), false);
         } else {
